@@ -26,7 +26,8 @@ from torch.nn.parameter import Parameter
 import torch.distributed as dist
 from torchlibrosa.stft import STFT, ISTFT, magphase
 import pytorch_lightning as pl
-from utils import do_mixup, get_mix_lambda, do_mixup_label
+from utils import get_mix_lambda, do_mixup_label
+from model.modelutils import do_mixup
 import random
 
 from torchcontrib.optim import SWA

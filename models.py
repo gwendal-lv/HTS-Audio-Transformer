@@ -5,8 +5,9 @@ import torch.nn.functional as F
 from torchlibrosa.stft import Spectrogram, LogmelFilterBank
 from torchlibrosa.augmentation import SpecAugmentation
 
-from utils import do_mixup, interpolate, pad_framewise_output
- 
+from utils import pad_framewise_output
+from model.modelutils import do_mixup, interpolate
+
 
 def init_layer(layer):
     """Initialize a Linear or Convolutional layer. """
