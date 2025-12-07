@@ -8,6 +8,8 @@
 
 import math
 import random
+from types import SimpleNamespace
+
 from numpy.core.fromnumeric import clip, reshape
 import torch
 import torch.nn as nn
@@ -16,8 +18,8 @@ import torch.utils.checkpoint as checkpoint
 from torchlibrosa.stft import Spectrogram, LogmelFilterBank
 from torchlibrosa.augmentation import SpecAugmentation
 
-from .layers import PatchEmbed, Mlp, DropPath, trunc_normal_, to_2tuple
-from .modelutils import do_mixup, interpolate
+from htsat_layers import PatchEmbed, Mlp, DropPath, trunc_normal_, to_2tuple
+from model.htsat_layers import do_mixup, interpolate
 
 
 # below codes are based and referred from https://github.com/microsoft/Swin-Transformer
@@ -394,21 +396,23 @@ class HTSAT_Swin_Transformer(nn.Module):
         ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
         patch_norm (bool): If True, add normalization after patch embedding. Default: True
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
-        config (module): The configuration Module from config.py
+        config (SimpleNamespace): Configuration (from a .yaml file, converted to types.SimpleNamespace)
     """
 
-    def __init__(self, spec_size=256, patch_size=4, patch_stride=(4,4), 
-                in_chans=1, num_classes=527,
+    def __init__(self,
+                 config: SimpleNamespace,
+                 spec_size=256, patch_size=4, patch_stride=(4,4),
+                 in_chans=1, num_classes=527,
                  embed_dim=96, depths=[2, 2, 6, 2], num_heads=[4, 8, 16, 32],
                  window_size=8, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, 
                  ape=False, patch_norm=True,
-                 use_checkpoint=False, norm_before_mlp='ln', config = None, **kwargs):
+                 use_checkpoint=False, norm_before_mlp='ln'):
         super(HTSAT_Swin_Transformer, self).__init__()
 
         self.config = config
-        self.spec_size = spec_size 
+        self.spec_size = spec_size
         self.patch_stride = patch_stride
         self.patch_size = patch_size
         self.window_size = window_size
@@ -452,9 +456,12 @@ class HTSAT_Swin_Transformer(nn.Module):
         self.logmel_extractor = LogmelFilterBank(sr=config.sample_rate, n_fft=config.window_size, 
             n_mels=config.mel_bins, fmin=config.fmin, fmax=config.fmax, ref=ref, amin=amin, top_db=top_db, 
             freeze_parameters=True)
-        # Spec augmenter
-        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
-            freq_drop_width=8, freq_stripes_num=2) # 2 2
+        # Spec augmenter FIXME Don't always instanciate this
+        if self.config.training_spec_augmentation:
+            self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2,
+                freq_drop_width=8, freq_stripes_num=2) # 2 2
+        else:
+            self.spec_augmenter = None
         self.bn0 = nn.BatchNorm2d(self.config.mel_bins)
 
 
@@ -500,6 +507,8 @@ class HTSAT_Swin_Transformer(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.maxpool = nn.AdaptiveMaxPool1d(1)
 
+        # TODO do architecture modifications: remove that .head attribute
+        #       (and expect errors during checkpoint loading)
         if self.config.enable_tscam:
             SF = self.spec_size // (2 ** (len(self.depths) - 1)) // self.patch_stride[0] // self.freq_ratio
             self.tscam_conv = nn.Conv2d(
@@ -531,7 +540,6 @@ class HTSAT_Swin_Transformer(nn.Module):
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
 
-
     def forward_features(self, x):
         frames_num = x.shape[2]
         # For a 10.0s 32kHz input:
@@ -552,9 +560,10 @@ class HTSAT_Swin_Transformer(nn.Module):
         for i, layer in enumerate(self.layers):
             x, attn = layer(x)
 
-        if self.config.enable_tscam:
-            # for x
-            x = self.norm(x)
+        # At this point, x is a short sequence of tokens, typical shape: (batch_size, 64, 768)
+        # TODO This final part should be moved to its own method; and overridden for custom final applications
+        if self.config.enable_tscam:  # token-semantic layer
+            x = self.norm(x)  # Layer norm
             B, N, C = x.shape
             SF = frames_num // (2 ** (len(self.depths) - 1)) // self.patch_stride[0]
             ST = frames_num // (2 ** (len(self.depths) - 1)) // self.patch_stride[1]
@@ -566,7 +575,7 @@ class HTSAT_Swin_Transformer(nn.Module):
             x = x.permute(0,1,3,2,4).contiguous().reshape(B, C, c_freq_bin, -1)
 
             # get latent_output
-            latent_output = self.avgpool(torch.flatten(x,2))
+            latent_output = self.avgpool(torch.flatten(x,2))  # Average token
             latent_output = torch.flatten(latent_output, 1)
 
             # display the attention map, if needed
@@ -584,15 +593,20 @@ class HTSAT_Swin_Transformer(nn.Module):
                 attn = ((attn * 0.15) + (attn_max * 0.85 - attn_min)) / (attn_max - attn_min)
                 attn = attn.unsqueeze(dim = 2)
 
-            x = self.tscam_conv(x)
+            # For 1 default audio 32kHz, hop 320, 64 mel-bins:
+            #    Shape before this conv: (1, 768, 2, 32)
+            #     Shape after this conv: (1, 527, 1, 32)             flattened later to (1, 527, 32)
+            x = self.tscam_conv(x)  # kernel_size: [2, 3]; num_classes output channels
             x = torch.flatten(x, 2) # B, C, T
 
+            # This framewise output is an interpolation of x which has very few frames here!
+            #    Defaults: interpolate 1024 frames from only 32 output "tokens of 527 logits"
             if self.config.htsat_attn_heatmap:
                 fpx = interpolate(torch.sigmoid(x).permute(0,2,1).contiguous() * attn, 8 * self.patch_stride[1]) 
             else: 
                 fpx = interpolate(torch.sigmoid(x).permute(0,2,1).contiguous(), 8 * self.patch_stride[1]) 
 
-            x = self.avgpool(x)
+            x = self.avgpool(x)  # Average logits
             x = torch.flatten(x, 1)
 
             if self.config.loss_type == "clip_ce":
@@ -639,9 +653,12 @@ class HTSAT_Swin_Transformer(nn.Module):
             tx[i][0] = x[i, 0, crop_pos:crop_pos + crop_size,:]
         return tx
 
-    # Reshape the wavform to a img size, if you want to use the pretrained swin transformer model
-    def reshape_wav2img(self, x):
-        B, C, T, F = x.shape
+    def reshape_spec2img(self, x):
+        """
+        Reshape the spectrogram, e.g. 64 mel-bins x 1024 time frames,
+        to an image size compatible with the pretrained swin transformer model (typically 256x256)
+        """
+        B, C, T, F = x.shape  # batch_size, num_channels, num_time_frames, num_frequency_bins
         target_T = int(self.spec_size * self.freq_ratio)
         target_F = self.spec_size // self.freq_ratio
         assert T <= target_T and F <= target_F, "the wav size should less than or equal to the swin input size"
@@ -650,12 +667,18 @@ class HTSAT_Swin_Transformer(nn.Module):
             x = nn.functional.interpolate(x, (target_T, x.shape[3]), mode="bicubic", align_corners=True)
         if F < target_F:
             x = nn.functional.interpolate(x, (x.shape[2], target_F), mode="bicubic", align_corners=True)
-        x = x.permute(0,1,3,2).contiguous()
+
+        # At this point, x is still a big single-ch mel-spectrogram (B, 1, time_frames, mel_bins)
+        x = x.permute(0,1,3,2).contiguous()  # output shape: (B, 1, mel_bins, time_frames)
         x = x.reshape(x.shape[0], x.shape[1], x.shape[2], self.freq_ratio, x.shape[3] // self.freq_ratio)
-        # print(x.shape)
-        x = x.permute(0,1,3,2,4).contiguous()
+        # x shape is now (B, 1, mel_bins, freq_ratio, time_frames/freq_ratio):
+        #     we've split the spectrograms (mel_bins) into n=freq_ratio sub-spectrograms for different time segments
+        # Next step: permute dims to retrieve the time-split spectrograms into the last dimensions
+        #     (freq_ratio is the number of "time-split spectrograms")
+        x = x.permute(0,1,3,2,4).contiguous()  # output: (B, 1, freq_ratio, mel_bins, time_frames/freq_ratio)
+        # This last reshape-op stacks multiple spectrograms on the frequency axis
         x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3], x.shape[4])
-        return x
+        return x  # Shape: (B, 1, mel_bins*freq_ratio, time_frames/freq_ratio)
     
     # Repeat the wavform to a img size, if you want to use the pretrained swin transformer model
     def repeat_wat2img(self, x, cur_pos):
@@ -674,27 +697,37 @@ class HTSAT_Swin_Transformer(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor, mixup_lambda = None, infer_mode = False):# out_feat_keys: List[str] = None):
-        x = self.spectrogram_extractor(x)   # (batch_size, 1, time_steps, freq_bins)
-        x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
-        
-        
-        x = x.transpose(1, 3)
-        x = self.bn0(x)
-        x = x.transpose(1, 3)
-        if self.training:
-            raise ValueError("spec_augmenter should probably be disabled (dataset augmentations should be enough)")
+        # Input audio x shape: (N, n_audio_samples) where N is the batch size
+        #     e.g., N x 320 000 for a 10.0s-long audio input @32kHz
+        # Output spectrograms shape: (N, 1, time_steps, freq_bins)
+        #     e.g., N x 1 x 1001 x 513 for window size 1024 and hop size 320
+        x = self.spectrogram_extractor(x)
+        # Output Mel-specs shape: (N, 1, time_steps, mel_bins)
+        #     e.g., N x 1 x 1001 x 64 (could use more mel bins for music, probably enough for speech)
+        x = self.logmel_extractor(x)
+
+        # Batch norm for each mel bin (the BN layer has 2*mel_bins parameters)
+        x = x.transpose(1, 3)  # out shape: (N, mel_bins, time_steps, 1)
+        x = self.bn0(x)  # a 1D batch norm could be used ("images" here are vectors, not matrices)
+        x = x.transpose(1, 3)  # out shape: (N, 1, time_steps, mel_bins) (same as before BN)
+
+        if self.training and self.spec_augmenter is not None:
             x = self.spec_augmenter(x)
         if self.training and mixup_lambda is not None:
-            raise ValueError("mixup_lambda should probably be disabled (dataset augmentations should be enough)")
             x = do_mixup(x, mixup_lambda)
-        
+            raise ValueError("mixup_lambda should probably be disabled (dataset augmentations should be enough)")
+
+        # self.spec_size seems to be the size of images expected by the pre-trained Swin Transformer
+        #    (pre-training on natural images, not spectrograms)
+        # self.freq_ratio stores how many mel-specs fit into an image of height self.spec_size
+        #    e.g., freq_ratio is 4 for 64 mel bins and self.spec_size=256
         if infer_mode:
             # in infer mode. we need to handle different length audio input
             frame_num = x.shape[2]
             target_T = int(self.spec_size * self.freq_ratio)
             repeat_ratio = math.floor(target_T / frame_num)
             x = x.repeat(repeats=(1,1,repeat_ratio,1))
-            x = self.reshape_wav2img(x)
+            x = self.reshape_spec2img(x)
             output_dict = self.forward_features(x)
         elif self.config.enable_repeat_mode:
             if self.training:
@@ -723,7 +756,7 @@ class HTSAT_Swin_Transformer(nn.Module):
             if x.shape[2] > self.freq_ratio * self.spec_size:
                 if self.training:
                     x = self.crop_wav(x, crop_size=self.freq_ratio * self.spec_size)
-                    x = self.reshape_wav2img(x)
+                    x = self.reshape_spec2img(x)
                     output_dict = self.forward_features(x)
                 else:
                     # Change: Hard code here
@@ -732,7 +765,7 @@ class HTSAT_Swin_Transformer(nn.Module):
                     crop_size = (x.shape[2] - 1) // 2
                     for cur_pos in range(0, x.shape[2] - crop_size - 1, overlap_size):
                         tx = self.crop_wav(x, crop_size = crop_size, spe_pos = cur_pos)
-                        tx = self.reshape_wav2img(tx)
+                        tx = self.reshape_spec2img(tx)
                         output_dicts.append(self.forward_features(tx))
                     clipwise_output = torch.zeros_like(output_dicts[0]["clipwise_output"]).float().to(x.device)
                     framewise_output = torch.zeros_like(output_dicts[0]["framewise_output"]).float().to(x.device)
@@ -746,7 +779,7 @@ class HTSAT_Swin_Transformer(nn.Module):
                         'clipwise_output': clipwise_output
                     }
             else: # this part is typically used, and most easy one
-                x = self.reshape_wav2img(x)
+                x = self.reshape_spec2img(x)
                 output_dict = self.forward_features(x)
         # x = self.head(x)
         return output_dict

@@ -6,7 +6,7 @@ from torchlibrosa.stft import Spectrogram, LogmelFilterBank
 from torchlibrosa.augmentation import SpecAugmentation
 
 from utils import pad_framewise_output
-from model.modelutils import do_mixup, interpolate
+from model.htsat_layers import do_mixup, interpolate
 
 
 def init_layer(layer):

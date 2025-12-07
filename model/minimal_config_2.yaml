@@ -1,18 +1,17 @@
 # Minimal configuration for running minimal_example.py
-# Only includes parameters needed to build the model and run an optional dummy forward.
+# This yaml file can be read
 
 # ---- Signal processing ----
-sample_rate: 32000     # 32 kHz (AudioSet / ESC-50)
-# FIXME For musical audio analysis, we should probably use different ones..
-#    e.g. smaller window size (much fewer mel bins anyways),
-#    and more mel bins (e.g. whisper uses 128)
-window_size: 1024      # STFT window size
-hop_size: 320          # STFT hop size
-mel_bins: 64           # Number of mel bins
+# Compared to default config: 16kHz, smaller window, more mel bins are less time frames (bigger hop relative to sr)
+sample_rate: 16000
+window_size: 512       # STFT window size
+# Adapted STFT hop size to get 512 frames exactly (instead of 501), to disable the bicubic interpolation
+hop_size: 313          # STFT hop size (orig: 320)
+mel_bins: 128           # Number of mel bins
 fmin: 50               # Min mel frequency
-fmax: 14000            # Max mel frequency
+fmax: 8000            # Max mel frequency
 
-clip_samples: 320000  # 10 seconds for 32 kHz
+clip_samples: 160000
 
 enable_repeat_mode: False # repeat the spectrogram / reshape the spectrogram
 
@@ -29,13 +28,13 @@ htsat_depth: [2, 2, 6, 2]
 htsat_window_size: 8
 
 # ---- Model options ----
-enable_tscam: True # enable the token-semantic layer
+enable_tscam: True  # enable the token-semantic layer
 # Some Deprecated Optimization in the model design, check the model code for details
 htsat_attn_heatmap: False
 htsat_hier_output: False
 htsat_use_max: False
 
-
-# TODO REMOVE
+# ---- Training options ----
+training_spec_augmentation: False
 loss_type: "clip_bce" #   AudioSet & SCV2: "clip_bce" |  ESC-50: "clip_ce"
 

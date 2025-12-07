@@ -1,5 +1,7 @@
 """
 Minimal demonstration to instantiate an HTS-AT model and load a checkpoint.
+Run this file from ./ (not from the repository's root).
+Files from this directory can be copied into another repository (no dependencies outside this directory).
 
 This script shows the smallest practical example of:
   1) Constructing the `HTSAT_Swin_Transformer` model using settings from `config.py`.
@@ -30,7 +32,7 @@ from typing import Dict, Any, Optional
 
 import torch
 
-from model.htsat import HTSAT_Swin_Transformer
+from htsat import HTSAT_Swin_Transformer
 import os
 import yaml
 
@@ -57,9 +59,7 @@ def _load_config(config_yaml_path="minimal_config.yaml") -> SimpleNamespace:
     Load configuration from YAML if provided/existing; otherwise fall back to config.py.
     Returns a SimpleNamespace with attribute access.
     """
-    # If a default minimal_config.yaml exists in the repo, use it
-    config_yaml_path = os.path.join(os.path.dirname(__file__), config_yaml_path)
-    with open(config_yaml_path, "r") as f:
+    with open(os.path.join(os.path.dirname(__file__), config_yaml_path), "r") as f:
         data = yaml.safe_load(f)
     return data
 
@@ -90,11 +90,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        required=True,
+        required=False,
         help="Path to the HTS-AT checkpoint (.ckpt or .pth)"
     )
     parser.add_argument(
-        "--config-yaml",
+        "--config",
         type=str,
         default="minimal_config.yaml",
         help="Path to minimal YAML config (defaults to ./minimal_config.yaml if present, otherwise falls back to config.py)",
@@ -107,25 +107,29 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     # 0) Load configuration (YAML preferred)
-    config_dict = _load_config(args.config_yaml)
+    config_dict = _load_config(args.config)
     cfg = SimpleNamespace(**config_dict)  # To access fields
 
     # 1) Build model
     model = _build_model(cfg)
 
-    # 2) Load checkpoint to CPU and normalize keys
-    ckpt = torch.load(args.checkpoint, map_location=torch.device("cpu"))
-    state_dict = _normalize_state_dict(ckpt)
+    if args.checkpoint is not None:
+        # 2) Load checkpoint to CPU and normalize keys
+        ckpt = torch.load(args.checkpoint, map_location=torch.device("cpu"))
+        state_dict = _normalize_state_dict(ckpt)
 
-    # 3) Load weights
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print("Loaded checkpoint:")
-    print(f"  Missing keys: {len(missing)}")
-    if missing:
-        print("   - " + "\n   - ".join(missing))
-    print(f"  Unexpected keys: {len(unexpected)}")
-    if unexpected:
-        print("   - " + "\n   - ".join(unexpected))
+        # 3) Load weights
+        try:
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            print("Loaded checkpoint:")
+            print(f"  Missing keys: {len(missing)}")
+            if missing:
+                print("   - " + "\n   - ".join(missing))
+            print(f"  Unexpected keys: {len(unexpected)}")
+            if unexpected:
+                print("   - " + "\n   - ".join(unexpected))
+        except RuntimeError as e:
+            warnings.warn(f"Failed to load checkpoint (Runtime Error):\n{e}")
 
     model.eval()
     print("Model is ready (eval mode).")
